@@ -93,7 +93,7 @@ async def session_event(data: SessionEvent):
     logger.info(f"Session event: {data.event} for {data.session_id[:8]}...")
 
     # Update session state
-    session = sessions.create_or_update(
+    session = await sessions.create_or_update(
         session_id=data.session_id,
         tty=data.tty,
         cwd=data.cwd,
@@ -119,8 +119,8 @@ async def session_event(data: SessionEvent):
     elif data.event == "SessionEnd":
         session.update(status="ended")
         await bot.notify_session_end(session)
-        # Keep session for a bit for reference, then remove
-        # sessions.remove(data.session_id)
+        # Remove session (also clears allow-all status)
+        await sessions.remove(data.session_id)
 
     return {"status": "ok"}
 
@@ -136,6 +136,11 @@ async def request_permission(data: PermissionRequestInput) -> PermissionResponse
     request_id = data.request_id or str(uuid.uuid4())
 
     logger.info(f"Permission request: {data.tool} - {data.command[:50]}...")
+
+    # Check if this session has allow-all enabled
+    if data.session_id and sessions.is_session_allowed(data.session_id):
+        logger.info(f"Auto-allowing request for session {data.session_id[:8]}... (allow-all enabled)")
+        return PermissionResponse(decision="allow", reason="Session has allow-all enabled")
 
     # Create pending request
     request = PendingRequest(

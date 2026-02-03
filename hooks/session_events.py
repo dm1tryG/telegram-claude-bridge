@@ -13,8 +13,14 @@ import time
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
-BRIDGE_URL = "http://127.0.0.1:8765"
+# Configurable via environment variable
+BRIDGE_URL = os.environ.get("BRIDGE_URL", "http://127.0.0.1:8765")
 TIMEOUT = 5  # Short timeout - don't block Claude Code
+
+
+def log_error(message: str) -> None:
+    """Log error to stderr (doesn't interfere with Claude Code stdout protocol)."""
+    print(f"[telegram-bridge] {message}", file=sys.stderr)
 
 
 def get_tty():
@@ -70,7 +76,8 @@ def get_last_assistant_message(transcript_path: str) -> str | None:
             except json.JSONDecodeError:
                 continue
         return None
-    except Exception:
+    except Exception as e:
+        log_error(f"Failed to read transcript: {e}")
         return None
 
 
@@ -86,16 +93,22 @@ def send_event(data: dict) -> None:
         )
         with urlopen(req, timeout=TIMEOUT) as response:
             response.read()
-    except (HTTPError, URLError, TimeoutError, Exception):
-        # Silently fail - don't block Claude Code
-        pass
+    except HTTPError as e:
+        log_error(f"Bridge HTTP error: {e.code} {e.reason}")
+    except URLError as e:
+        log_error(f"Bridge connection error: {e.reason}")
+    except TimeoutError:
+        log_error("Bridge request timeout")
+    except Exception as e:
+        log_error(f"Unexpected error: {type(e).__name__}: {e}")
 
 
 def main():
     """Process session event from Claude Code."""
     try:
         data = json.load(sys.stdin)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        log_error(f"Failed to parse hook input: {e}")
         sys.exit(0)
 
     session_id = data.get("session_id", "unknown")

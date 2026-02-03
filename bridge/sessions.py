@@ -1,12 +1,39 @@
 """Session tracking for Claude Code sessions."""
 
+import asyncio
 import logging
+import os
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def find_tmux() -> Optional[str]:
+    """Find tmux executable path."""
+    # Try shutil.which first (respects PATH)
+    tmux_path = shutil.which("tmux")
+    if tmux_path:
+        return tmux_path
+
+    # Common installation paths
+    common_paths = [
+        "/opt/homebrew/bin/tmux",  # macOS ARM Homebrew
+        "/usr/local/bin/tmux",      # macOS Intel Homebrew / Linux manual
+        "/usr/bin/tmux",            # Linux package manager
+    ]
+    for path in common_paths:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+
+    return None
+
+
+TMUX_PATH = find_tmux()
 
 
 @dataclass
@@ -42,14 +69,17 @@ class Session:
             return False
 
         # Method 1: Try tmux send-keys (this actually works with Claude Code!)
-        try:
-            # First try to find pane by TTY
-            result = subprocess.run(
-                ['/opt/homebrew/bin/tmux', 'list-panes', '-a', '-F', '#{pane_tty} #{session_name}:#{window_index}.#{pane_index}'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
+        if not TMUX_PATH:
+            logger.debug("tmux not found, skipping tmux method")
+        else:
+            try:
+                # First try to find pane by TTY
+                result = subprocess.run(
+                    [TMUX_PATH, 'list-panes', '-a', '-F', '#{pane_tty} #{session_name}:#{window_index}.#{pane_index}'],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
 
             tmux_target = None
             if result.returncode == 0:
@@ -70,33 +100,33 @@ class Session:
                                 logger.info(f"Using tmux session 'claude': {tmux_target}")
                                 break
 
-            if tmux_target:
-                # Send text first
-                send_result = subprocess.run(
-                    ['/opt/homebrew/bin/tmux', 'send-keys', '-t', tmux_target, '-l', text],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-                if send_result.returncode != 0:
-                    logger.warning(f"tmux send-keys text failed: {send_result.stderr}")
+                if tmux_target:
+                    # Send text first
+                    send_result = subprocess.run(
+                        [TMUX_PATH, 'send-keys', '-t', tmux_target, '-l', text],
+                        capture_output=True,
+                        text=True,
+                        timeout=10
+                    )
+                    if send_result.returncode != 0:
+                        logger.warning(f"tmux send-keys text failed: {send_result.stderr}")
 
-                # Then send Enter separately
-                enter_result = subprocess.run(
-                    ['/opt/homebrew/bin/tmux', 'send-keys', '-t', tmux_target, 'Enter'],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-                if send_result.returncode == 0 and enter_result.returncode == 0:
-                    logger.info(f"Sent input via tmux to {tmux_target}: {text[:50]}...")
-                    return True
-                else:
-                    logger.warning(f"tmux send Enter failed: {enter_result.stderr}")
-        except FileNotFoundError:
-            logger.debug("tmux not found, trying iTerm2")
-        except Exception as e:
-            logger.warning(f"tmux method failed: {e}")
+                    # Then send Enter separately
+                    enter_result = subprocess.run(
+                        [TMUX_PATH, 'send-keys', '-t', tmux_target, 'Enter'],
+                        capture_output=True,
+                        text=True,
+                        timeout=10
+                    )
+                    if send_result.returncode == 0 and enter_result.returncode == 0:
+                        logger.info(f"Sent input via tmux to {tmux_target}: {text[:50]}...")
+                        return True
+                    else:
+                        logger.warning(f"tmux send Enter failed: {enter_result.stderr}")
+            except FileNotFoundError:
+                logger.debug("tmux not found, trying iTerm2")
+            except Exception as e:
+                logger.warning(f"tmux method failed: {e}")
 
         # Method 2: iTerm2 write text (text appears but doesn't submit in Claude Code)
         try:
@@ -146,12 +176,7 @@ class Session:
         if not self.cwd:
             return "unknown"
         # Replace home dir with ~
-        home = subprocess.run(
-            ["echo", "$HOME"],
-            capture_output=True,
-            text=True,
-            shell=True
-        ).stdout.strip()
+        home = str(Path.home())
         if home and self.cwd.startswith(home):
             return "~" + self.cwd[len(home):]
         return self.cwd
@@ -173,6 +198,8 @@ class SessionManager:
 
     def __init__(self):
         self._sessions: Dict[str, Session] = {}
+        self._lock = asyncio.Lock()
+        self._allowed_sessions: set[str] = set()  # Sessions with "Allow All" enabled
 
     def get(self, session_id: str) -> Optional[Session]:
         """Get a session by ID."""
@@ -185,22 +212,35 @@ class SessionManager:
                 return session
         return None
 
-    def create_or_update(self, session_id: str, **kwargs) -> Session:
+    async def create_or_update(self, session_id: str, **kwargs) -> Session:
         """Create a new session or update existing one."""
-        if session_id in self._sessions:
-            session = self._sessions[session_id]
-            session.update(**kwargs)
-        else:
-            session = Session(session_id=session_id, **kwargs)
-            self._sessions[session_id] = session
-            logger.info(f"New session: {session_id}")
-        return session
+        async with self._lock:
+            if session_id in self._sessions:
+                session = self._sessions[session_id]
+                session.update(**kwargs)
+            else:
+                session = Session(session_id=session_id, **kwargs)
+                self._sessions[session_id] = session
+                logger.info(f"New session: {session_id}")
+            return session
 
-    def remove(self, session_id: str) -> None:
+    async def remove(self, session_id: str) -> None:
         """Remove a session."""
-        if session_id in self._sessions:
-            del self._sessions[session_id]
-            logger.info(f"Session removed: {session_id}")
+        async with self._lock:
+            if session_id in self._sessions:
+                del self._sessions[session_id]
+                logger.info(f"Session removed: {session_id}")
+            # Also remove from allowed sessions
+            self._allowed_sessions.discard(session_id)
+
+    def allow_session(self, session_id: str) -> None:
+        """Mark a session as allowed for all future requests."""
+        self._allowed_sessions.add(session_id)
+        logger.info(f"Session {session_id} marked as allow-all")
+
+    def is_session_allowed(self, session_id: str) -> bool:
+        """Check if a session has allow-all enabled."""
+        return session_id in self._allowed_sessions
 
     def all(self) -> list[Session]:
         """Get all active sessions."""

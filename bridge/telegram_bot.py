@@ -381,7 +381,14 @@ class TelegramBot:
             await query.edit_message_text("⚠️ Request expired or already handled.")
             return
 
-        if action in ("allow", "allow_session"):
+        if action == "allow_session":
+            # Mark session for allow-all future requests
+            if request.session_id:
+                sessions.allow_session(request.session_id)
+            request.decision = "allow"
+            emoji = "✅"
+            status = "Allowed (all session)"
+        elif action == "allow":
             request.decision = "allow"
             emoji = "✅"
             status = "Allowed"

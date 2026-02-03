@@ -8,13 +8,20 @@ approval via Telegram.
 """
 
 import json
+import os
 import sys
 import uuid
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
-BRIDGE_URL = "http://127.0.0.1:8765"
+# Configurable via environment variable
+BRIDGE_URL = os.environ.get("BRIDGE_URL", "http://127.0.0.1:8765")
 TIMEOUT = 310  # Slightly longer than bridge timeout
+
+
+def log_error(message: str) -> None:
+    """Log error to stderr (doesn't interfere with Claude Code stdout protocol)."""
+    print(f"[telegram-bridge] {message}", file=sys.stderr)
 
 
 def main():
@@ -22,8 +29,8 @@ def main():
     # Read hook input from stdin
     try:
         input_data = json.load(sys.stdin)
-    except json.JSONDecodeError:
-        # If we can't parse input, deny by default
+    except json.JSONDecodeError as e:
+        log_error(f"Failed to parse hook input: {e}")
         output_deny("Failed to parse hook input")
         return
 
@@ -72,14 +79,18 @@ def main():
             output_deny(reason)
 
     except HTTPError as e:
+        log_error(f"Bridge HTTP error: {e.code} {e.reason}")
         # Bridge error - fallback to normal Claude Code UI
         sys.exit(0)
     except URLError as e:
+        log_error(f"Bridge connection error: {e.reason} (is bridge running?)")
         # Bridge not running - fallback to normal Claude Code UI
         sys.exit(0)
     except TimeoutError:
+        log_error("Bridge request timeout")
         output_deny("Telegram approval timeout")
     except Exception as e:
+        log_error(f"Unexpected error: {type(e).__name__}: {e}")
         # Unknown error - fallback to normal Claude Code UI
         sys.exit(0)
 

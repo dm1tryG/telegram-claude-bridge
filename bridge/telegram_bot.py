@@ -15,6 +15,21 @@ from .state import state, PendingRequest
 logger = logging.getLogger(__name__)
 
 
+def authorized_only(func):
+    """Decorator to restrict handlers to authorized chat_id only."""
+    async def wrapper(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        if chat_id != settings.telegram_chat_id:
+            logger.warning(f"Unauthorized access attempt from chat_id: {chat_id}")
+            if update.message:
+                await update.message.reply_text("⛔ Unauthorized. This bot is private.")
+            elif update.callback_query:
+                await update.callback_query.answer("⛔ Unauthorized", show_alert=True)
+            return
+        return await func(self, update, context)
+    return wrapper
+
+
 class TelegramBot:
     """Telegram bot that handles permission requests."""
 
@@ -119,6 +134,7 @@ class TelegramBot:
         except Exception as e:
             logger.error(f"Failed to update message: {e}")
 
+    @authorized_only
     async def _cmd_start(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -132,6 +148,7 @@ class TelegramBot:
             parse_mode="Markdown",
         )
 
+    @authorized_only
     async def _cmd_status(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -146,6 +163,7 @@ class TelegramBot:
             parse_mode="Markdown",
         )
 
+    @authorized_only
     async def _cmd_pending(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -163,6 +181,7 @@ class TelegramBot:
 
         await update.message.reply_text(text, parse_mode="Markdown")
 
+    @authorized_only
     async def _handle_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:

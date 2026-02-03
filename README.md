@@ -1,6 +1,6 @@
 # Telegram ↔ Claude Code Permission Bridge
 
-A daemon service that forwards Claude Code permission requests to Telegram for approval.
+A daemon service that forwards Claude Code permission requests to Telegram for approval. Also supports session tracking and bidirectional communication with Claude Code.
 
 ## Architecture
 
@@ -10,12 +10,30 @@ A daemon service that forwards Claude Code permission requests to Telegram for a
 │                 │◀────│   (Python daemon)    │◀────│      Bot        │
 └─────────────────┘     └──────────────────────┘     └─────────────────┘
         │                         │
-        │ Hook stdin/stdout       │ In-memory state
-        │                         │ (pending requests)
+        │ Hooks:                  │ In-memory state:
+        │ - PermissionRequest     │ - Pending requests
+        │ - SessionStart          │ - Active sessions
+        │ - Notification          │
+        │ - Stop                  │
+        │ - SessionEnd            │
         ▼                         ▼
-   Permission                  FastAPI
-   Decision                    Server
+   stdin/stdout               FastAPI Server
+   via tmux                   (REST API)
 ```
+
+## Features
+
+- **Permission Requests** — Approve/deny Claude Code actions from Telegram
+- **Session Tracking** — See active Claude Code sessions with status
+- **Bidirectional Input** — Send text input to Claude Code from Telegram
+- **Authorization** — Bot only responds to configured chat ID
+
+## Requirements
+
+- Python 3.11+
+- [uv](https://github.com/astral-sh/uv) package manager
+- `jq` (for hook installation)
+- Telegram account
 
 ## Setup
 
@@ -24,6 +42,16 @@ A daemon service that forwards Claude Code permission requests to Telegram for a
 ```bash
 cd telegram-claude-bridge
 uv sync
+```
+
+Install `jq` if not present:
+
+```bash
+# macOS
+brew install jq
+
+# Ubuntu/Debian
+sudo apt install jq
 ```
 
 ### 2. Create Telegram Bot
@@ -45,11 +73,11 @@ cp .env.example .env
 # Edit .env with your values
 ```
 
-Or export directly:
+Required variables:
 
 ```bash
-export TELEGRAM_BOT_TOKEN="your-bot-token"
-export TELEGRAM_CHAT_ID="your-chat-id"
+TELEGRAM_BOT_TOKEN="your-bot-token"
+TELEGRAM_CHAT_ID="your-chat-id"
 ```
 
 ### 5. Install Claude Code hooks
@@ -58,10 +86,37 @@ export TELEGRAM_CHAT_ID="your-chat-id"
 ./hooks/install.sh
 ```
 
-### 6. Start the bridge daemon
+This installs 5 hooks into `~/.claude/settings.json`:
+- `PermissionRequest` — forwards permission requests
+- `SessionStart` — notifies on new sessions
+- `Notification` — forwards idle prompts
+- `Stop` — tracks session stops
+- `SessionEnd` — notifies on session end
+
+### 6. Start the bridge
+
+**Manual:**
 
 ```bash
 uv run telegram-claude-bridge
+```
+
+**As macOS service (LaunchAgent):**
+
+```bash
+./install-service.sh
+```
+
+Check service status:
+
+```bash
+./status.sh
+```
+
+Uninstall service:
+
+```bash
+./uninstall-service.sh
 ```
 
 ### 7. Start Claude Code
@@ -72,7 +127,9 @@ claude
 
 ## Usage
 
-When Claude Code requests permission to execute a tool, you'll receive a Telegram message:
+### Permission Requests
+
+When Claude Code requests permission, you'll receive a Telegram message:
 
 ```
 🔐 Permission Request
@@ -85,22 +142,36 @@ rm -rf node_modules
 [✅ Allow All Session]
 ```
 
-- **Allow** - Permit this single action
-- **Deny** - Block this action
-- **Allow All Session** - Allow all similar actions in this session
+- **Allow** — Permit this single action
+- **Deny** — Block this action
+- **Allow All Session** — Allow this action (session-wide allowlisting not yet implemented)
+
+### Session Input
+
+You can send input to active Claude Code sessions:
+
+1. Run `/sessions` to see active sessions
+2. Tap **Reply** button on a session
+3. Type your message and send
+4. Use `/cancel` to exit reply mode
 
 ## Telegram Commands
 
-- `/start` - Show welcome message
-- `/status` - Show bridge status
-- `/pending` - List pending requests
+| Command | Description |
+|---------|-------------|
+| `/start` | Show welcome message |
+| `/status` | Show bridge status (pending requests, active sessions) |
+| `/pending` | List pending permission requests |
+| `/sessions` | List active Claude Code sessions |
+| `/cancel` | Exit reply mode |
 
 ## API Endpoints
 
-The bridge exposes a REST API:
-
-- `GET /health` - Health check
-- `POST /permission` - Request permission (used by hook)
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health check, returns `{status, pending, sessions}` |
+| `/permission` | POST | Submit permission request (used by hook) |
+| `/session` | POST | Submit session events (used by hooks) |
 
 ## Configuration
 
@@ -112,14 +183,20 @@ The bridge exposes a REST API:
 | `BRIDGE_PORT` | Port to listen on | `8765` |
 | `PERMISSION_TIMEOUT` | Timeout in seconds | `300` |
 
+**Note:** Bridge URL (`http://127.0.0.1:8765`) is hardcoded in hook scripts. If you change `BRIDGE_PORT`, update the URLs in `hooks/permission_request.py` and `hooks/session_events.py`.
+
+## Known Limitations
+
+- **In-memory state** — Session data is lost on bridge restart
+- **Allow All Session** — Currently behaves same as Allow (session-wide allowlisting not implemented)
+- **Single user** — Bot only responds to one configured `TELEGRAM_CHAT_ID`
+- **tmux dependency** — Session input requires Claude Code running in tmux
+
 ## Development
 
 ```bash
 # Install dev dependencies
 uv sync --dev
-
-# Run tests
-uv run pytest
 
 # Lint
 uv run ruff check .

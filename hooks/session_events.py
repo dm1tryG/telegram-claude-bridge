@@ -9,6 +9,7 @@ It handles SessionStart, Notification, Stop, and SessionEnd events.
 import json
 import os
 import sys
+import time
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
@@ -43,6 +44,34 @@ def get_tty():
         pass
 
     return None
+
+
+def get_last_assistant_message(transcript_path: str) -> str | None:
+    """Read the last assistant message from transcript file."""
+    if not transcript_path:
+        return None
+
+    try:
+        # Read all lines and reverse to find last assistant message
+        with open(transcript_path, 'r') as f:
+            lines = f.readlines()
+
+        # Go through lines from the end
+        for line in reversed(lines):
+            try:
+                entry = json.loads(line.strip())
+                if entry.get("type") == "assistant":
+                    msg = entry.get("message", {})
+                    content = msg.get("content", [])
+                    # Find text content (from the end of content array too)
+                    for item in reversed(content):
+                        if item.get("type") == "text":
+                            return item.get("text", "")
+            except json.JSONDecodeError:
+                continue
+        return None
+    except Exception:
+        return None
 
 
 def send_event(data: dict) -> None:
@@ -93,16 +122,27 @@ def main():
     elif event == "Notification":
         notification_type = data.get("notification_type")
         payload["notification_type"] = notification_type
-        payload["message"] = data.get("message")
 
         if notification_type == "idle_prompt":
             payload["status"] = "waiting_for_input"
+            # Small delay to ensure transcript is written
+            time.sleep(0.3)
+            # Get actual last message from transcript
+            transcript_path = data.get("transcript_path")
+            last_msg = get_last_assistant_message(transcript_path)
+            payload["message"] = last_msg or "No message"
         else:
             payload["status"] = "notification"
+            payload["message"] = data.get("message")
 
     elif event == "Stop":
         payload["status"] = "waiting_for_input"
-        payload["message"] = data.get("message")
+        # Small delay to ensure transcript is written
+        time.sleep(0.3)
+        # Get actual last message from transcript
+        transcript_path = data.get("transcript_path")
+        last_msg = get_last_assistant_message(transcript_path)
+        payload["message"] = last_msg or "No message"
 
     elif event == "SessionEnd":
         payload["status"] = "ended"

@@ -31,26 +31,113 @@ class Session:
         self.updated_at = datetime.now()
 
     def send_input(self, text: str) -> bool:
-        """Send input text to the session's TTY."""
+        """Send input text to the session.
+
+        Tries multiple methods:
+        1. tmux send-keys (works with Claude Code!)
+        2. iTerm2 write text (fallback, doesn't submit in Claude Code)
+        """
         if not self.tty:
             logger.error(f"No TTY for session {self.session_id}")
             return False
 
+        # Method 1: Try tmux send-keys (this actually works with Claude Code!)
         try:
-            # Write to TTY with newline to submit
-            with open(self.tty, 'w') as tty_file:
-                tty_file.write(text + '\n')
-                tty_file.flush()
-            logger.info(f"Sent input to {self.tty}: {text[:50]}...")
-            return True
-        except PermissionError:
-            logger.error(f"Permission denied writing to {self.tty}")
-            return False
+            # First try to find pane by TTY
+            result = subprocess.run(
+                ['/opt/homebrew/bin/tmux', 'list-panes', '-a', '-F', '#{pane_tty} #{session_name}:#{window_index}.#{pane_index}'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+
+            tmux_target = None
+            if result.returncode == 0:
+                for line in result.stdout.strip().split('\n'):
+                    if line and self.tty and self.tty in line:
+                        parts = line.split(' ', 1)
+                        if len(parts) == 2:
+                            tmux_target = parts[1]
+                            break
+
+                # If not found by TTY, look for session named "claude"
+                if not tmux_target:
+                    for line in result.stdout.strip().split('\n'):
+                        if line and 'claude:' in line:
+                            parts = line.split(' ', 1)
+                            if len(parts) == 2:
+                                tmux_target = parts[1]
+                                logger.info(f"Using tmux session 'claude': {tmux_target}")
+                                break
+
+            if tmux_target:
+                # Send text first
+                send_result = subprocess.run(
+                    ['/opt/homebrew/bin/tmux', 'send-keys', '-t', tmux_target, '-l', text],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if send_result.returncode != 0:
+                    logger.warning(f"tmux send-keys text failed: {send_result.stderr}")
+
+                # Then send Enter separately
+                enter_result = subprocess.run(
+                    ['/opt/homebrew/bin/tmux', 'send-keys', '-t', tmux_target, 'Enter'],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if send_result.returncode == 0 and enter_result.returncode == 0:
+                    logger.info(f"Sent input via tmux to {tmux_target}: {text[:50]}...")
+                    return True
+                else:
+                    logger.warning(f"tmux send Enter failed: {enter_result.stderr}")
         except FileNotFoundError:
-            logger.error(f"TTY not found: {self.tty}")
-            return False
+            logger.debug("tmux not found, trying iTerm2")
         except Exception as e:
-            logger.error(f"Failed to send input to {self.tty}: {e}")
+            logger.warning(f"tmux method failed: {e}")
+
+        # Method 2: iTerm2 write text (text appears but doesn't submit in Claude Code)
+        try:
+            tty_name = self.tty.replace("/dev/", "")
+            escaped_text = text.replace('\\', '\\\\').replace('"', '\\"')
+
+            iterm_script = f'''
+            tell application "iTerm2"
+                repeat with w in windows
+                    repeat with t in tabs of w
+                        repeat with s in sessions of t
+                            if tty of s contains "{tty_name}" then
+                                tell s
+                                    write text "{escaped_text}" newline yes
+                                end tell
+                                return "ok"
+                            end if
+                        end repeat
+                    end repeat
+                end repeat
+                return "not found"
+            end tell
+            '''
+
+            result = subprocess.run(
+                ['osascript', '-e', iterm_script],
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+
+            if result.returncode == 0 and result.stdout.strip() == "ok":
+                logger.info(f"Sent input via iTerm2 (note: may need manual Enter for Claude Code): {text[:50]}...")
+                return True
+
+            error_msg = result.stderr.strip() or result.stdout.strip()
+            logger.error(f"iTerm2 write text failed: {error_msg}")
+            return False
+
+        except Exception as e:
+            logger.error(f"Failed to send input: {e}")
             return False
 
     @property

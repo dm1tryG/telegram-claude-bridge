@@ -81,48 +81,48 @@ class Session:
                     timeout=5
                 )
 
-            tmux_target = None
-            if result.returncode == 0:
-                for line in result.stdout.strip().split('\n'):
-                    if line and self.tty and self.tty in line:
-                        parts = line.split(' ', 1)
-                        if len(parts) == 2:
-                            tmux_target = parts[1]
-                            break
-
-                # If not found by TTY, look for session named "claude"
-                if not tmux_target:
+                tmux_target = None
+                if result.returncode == 0:
                     for line in result.stdout.strip().split('\n'):
-                        if line and 'claude:' in line:
+                        if line and self.tty and self.tty in line:
                             parts = line.split(' ', 1)
                             if len(parts) == 2:
                                 tmux_target = parts[1]
-                                logger.info(f"Using tmux session 'claude': {tmux_target}")
                                 break
 
-                if tmux_target:
-                    # Send text first
-                    send_result = subprocess.run(
-                        [TMUX_PATH, 'send-keys', '-t', tmux_target, '-l', text],
-                        capture_output=True,
-                        text=True,
-                        timeout=10
-                    )
-                    if send_result.returncode != 0:
-                        logger.warning(f"tmux send-keys text failed: {send_result.stderr}")
+                    # If not found by TTY, look for session named "claude"
+                    if not tmux_target:
+                        for line in result.stdout.strip().split('\n'):
+                            if line and 'claude:' in line:
+                                parts = line.split(' ', 1)
+                                if len(parts) == 2:
+                                    tmux_target = parts[1]
+                                    logger.info(f"Using tmux session 'claude': {tmux_target}")
+                                    break
 
-                    # Then send Enter separately
-                    enter_result = subprocess.run(
-                        [TMUX_PATH, 'send-keys', '-t', tmux_target, 'Enter'],
-                        capture_output=True,
-                        text=True,
-                        timeout=10
-                    )
-                    if send_result.returncode == 0 and enter_result.returncode == 0:
-                        logger.info(f"Sent input via tmux to {tmux_target}: {text[:50]}...")
-                        return True
-                    else:
-                        logger.warning(f"tmux send Enter failed: {enter_result.stderr}")
+                    if tmux_target:
+                        # Send text first
+                        send_result = subprocess.run(
+                            [TMUX_PATH, 'send-keys', '-t', tmux_target, '-l', text],
+                            capture_output=True,
+                            text=True,
+                            timeout=10
+                        )
+                        if send_result.returncode != 0:
+                            logger.warning(f"tmux send-keys text failed: {send_result.stderr}")
+
+                        # Then send Enter separately
+                        enter_result = subprocess.run(
+                            [TMUX_PATH, 'send-keys', '-t', tmux_target, 'Enter'],
+                            capture_output=True,
+                            text=True,
+                            timeout=10
+                        )
+                        if send_result.returncode == 0 and enter_result.returncode == 0:
+                            logger.info(f"Sent input via tmux to {tmux_target}: {text[:50]}...")
+                            return True
+                        else:
+                            logger.warning(f"tmux send Enter failed: {enter_result.stderr}")
             except FileNotFoundError:
                 logger.debug("tmux not found, trying iTerm2")
             except Exception as e:

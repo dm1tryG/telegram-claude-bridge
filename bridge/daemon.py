@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from .config import settings
 from .state import state, PendingRequest
+from .sessions import sessions
 from .telegram_bot import bot
 
 logging.basicConfig(
@@ -36,6 +37,20 @@ class PermissionResponse(BaseModel):
 
     decision: str
     reason: str | None = None
+
+
+class SessionEvent(BaseModel):
+    """Input model for session events from hooks."""
+
+    session_id: str
+    event: str  # SessionStart, Notification, Stop, etc.
+    status: str | None = None
+    tty: str | None = None
+    cwd: str | None = None
+    pid: int | None = None
+    tool: str | None = None
+    message: str | None = None
+    notification_type: str | None = None
 
 
 @asynccontextmanager
@@ -65,7 +80,49 @@ app = FastAPI(
 @app.get("/health")
 async def health():
     """Health check endpoint."""
-    return {"status": "ok", "pending": state.count()}
+    return {"status": "ok", "pending": state.count(), "sessions": sessions.count()}
+
+
+@app.post("/session")
+async def session_event(data: SessionEvent):
+    """
+    Receive session events from Claude Code hooks.
+
+    This tracks session state and sends notifications to Telegram.
+    """
+    logger.info(f"Session event: {data.event} for {data.session_id[:8]}...")
+
+    # Update session state
+    session = sessions.create_or_update(
+        session_id=data.session_id,
+        tty=data.tty,
+        cwd=data.cwd,
+        pid=data.pid,
+        status=data.status,
+        last_tool=data.tool,
+    )
+
+    # Handle specific events
+    if data.event == "SessionStart":
+        await bot.notify_session_start(session)
+
+    elif data.event == "Notification":
+        if data.notification_type == "idle_prompt":
+            # Session is waiting for input - update message and notify
+            session.update(status="waiting_for_input", last_message=data.message)
+            await bot.notify_session_idle(session)
+
+    elif data.event == "Stop":
+        session.update(status="waiting_for_input", last_message=data.message)
+        await bot.notify_session_idle(session)
+
+    elif data.event == "SessionEnd":
+        session.update(status="ended")
+        await bot.notify_session_end(session)
+        # Keep session for a bit for reference, then remove
+        # sessions.remove(data.session_id)
+
+    return {"status": "ok"}
 
 
 @app.post("/permission", response_model=PermissionResponse)

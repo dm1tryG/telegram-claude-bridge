@@ -1,4 +1,4 @@
-"""Telegram bot for permission approvals."""
+"""Telegram bot for permission approvals and session management."""
 
 import logging
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -7,10 +7,13 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 from .config import settings
 from .state import state, PendingRequest
+from .sessions import sessions, Session
 
 logger = logging.getLogger(__name__)
 
@@ -31,11 +34,13 @@ def authorized_only(func):
 
 
 class TelegramBot:
-    """Telegram bot that handles permission requests."""
+    """Telegram bot that handles permission requests and sessions."""
 
     def __init__(self):
         self.app: Application | None = None
         self._initialized = False
+        # Track which session each user is replying to
+        self._reply_targets: dict[int, str] = {}  # chat_id -> session_id
 
     async def initialize(self) -> None:
         """Initialize the Telegram bot application."""
@@ -52,7 +57,14 @@ class TelegramBot:
         self.app.add_handler(CommandHandler("start", self._cmd_start))
         self.app.add_handler(CommandHandler("status", self._cmd_status))
         self.app.add_handler(CommandHandler("pending", self._cmd_pending))
+        self.app.add_handler(CommandHandler("sessions", self._cmd_sessions))
+        self.app.add_handler(CommandHandler("cancel", self._cmd_cancel))
         self.app.add_handler(CallbackQueryHandler(self._handle_callback))
+        # Handle text messages for session replies
+        self.app.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            self._handle_text_message
+        ))
 
         await self.app.initialize()
         await self.app.start()
@@ -144,7 +156,9 @@ class TelegramBot:
             "I'll forward permission requests from Claude Code for your approval.\n\n"
             "*Commands:*\n"
             "/status - Show bridge status\n"
-            "/pending - Show pending requests",
+            "/sessions - Show active sessions\n"
+            "/pending - Show pending permission requests\n"
+            "/cancel - Cancel current reply mode",
             parse_mode="Markdown",
         )
 
@@ -154,10 +168,12 @@ class TelegramBot:
     ) -> None:
         """Handle /status command."""
         pending_count = state.count()
+        sessions_count = sessions.count()
         status_emoji = "🟢" if pending_count == 0 else "🟡"
 
         await update.message.reply_text(
             f"{status_emoji} *Bridge Status*\n\n"
+            f"Active sessions: {sessions_count}\n"
             f"Pending requests: {pending_count}\n"
             f"Timeout: {settings.permission_timeout}s",
             parse_mode="Markdown",
@@ -182,6 +198,151 @@ class TelegramBot:
         await update.message.reply_text(text, parse_mode="Markdown")
 
     @authorized_only
+    async def _cmd_sessions(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /sessions command."""
+        active = sessions.active()
+
+        if not active:
+            await update.message.reply_text("No active sessions.")
+            return
+
+        text = "*Active Sessions:*\n\n"
+        for s in active:
+            text += f"{s.status_emoji} `{s.session_id[:8]}...`\n"
+            text += f"   📁 {s.display_cwd}\n"
+            if s.status == "waiting_for_input" and s.last_message:
+                msg_short = s.last_message[:100] + "..." if len(s.last_message) > 100 else s.last_message
+                text += f"   💬 _{msg_short}_\n"
+            text += "\n"
+
+        await update.message.reply_text(text, parse_mode="Markdown")
+
+    @authorized_only
+    async def _cmd_cancel(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /cancel command - cancel reply mode."""
+        chat_id = update.effective_chat.id
+        if chat_id in self._reply_targets:
+            del self._reply_targets[chat_id]
+            await update.message.reply_text("✅ Reply mode cancelled.")
+        else:
+            await update.message.reply_text("No active reply mode.")
+
+    @authorized_only
+    async def _handle_text_message(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle text messages - send to target session if in reply mode."""
+        chat_id = update.effective_chat.id
+
+        if chat_id not in self._reply_targets:
+            await update.message.reply_text(
+                "💡 To send a message to a session, tap the *Reply* button "
+                "on a session notification first.",
+                parse_mode="Markdown"
+            )
+            return
+
+        session_id = self._reply_targets[chat_id]
+        session = sessions.get(session_id)
+
+        if not session:
+            del self._reply_targets[chat_id]
+            await update.message.reply_text("⚠️ Session no longer exists.")
+            return
+
+        text = update.message.text
+        success = session.send_input(text)
+
+        if success:
+            # Clear reply target after sending
+            del self._reply_targets[chat_id]
+            await update.message.reply_text(
+                f"✅ Sent to session `{session_id[:8]}...`\n\n"
+                f"```\n{text[:200]}\n```",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ Failed to send to session. TTY may be closed."
+            )
+
+    async def notify_session_start(self, session: Session) -> None:
+        """Notify about a new session starting."""
+        if not self.app:
+            return
+
+        text = (
+            f"🆕 *New Session*\n\n"
+            f"📁 `{session.display_cwd}`\n"
+            f"🔑 `{session.session_id[:8]}...`"
+        )
+
+        try:
+            await self.app.bot.send_message(
+                chat_id=settings.telegram_chat_id,
+                text=text,
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify session start: {e}")
+
+    async def notify_session_idle(self, session: Session) -> None:
+        """Notify that a session is waiting for input."""
+        if not self.app:
+            return
+
+        keyboard = [[
+            InlineKeyboardButton(
+                "📝 Reply",
+                callback_data=f"reply:{session.session_id}"
+            ),
+        ]]
+
+        # Truncate message for display
+        msg_display = session.last_message or "No message"
+        if len(msg_display) > 500:
+            msg_display = msg_display[:500] + "..."
+
+        text = (
+            f"💬 *Session waiting for input*\n\n"
+            f"📁 `{session.display_cwd}`\n\n"
+            f"*Claude:*\n{msg_display}"
+        )
+
+        try:
+            await self.app.bot.send_message(
+                chat_id=settings.telegram_chat_id,
+                text=text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify session idle: {e}")
+
+    async def notify_session_end(self, session: Session) -> None:
+        """Notify that a session has ended."""
+        if not self.app:
+            return
+
+        text = (
+            f"✅ *Session ended*\n\n"
+            f"📁 `{session.display_cwd}`"
+        )
+
+        try:
+            await self.app.bot.send_message(
+                chat_id=settings.telegram_chat_id,
+                text=text,
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify session end: {e}")
+
+    @authorized_only
     async def _handle_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -193,9 +354,29 @@ class TelegramBot:
         if ":" not in data:
             return
 
-        action, request_id = data.split(":", 1)
+        action, target_id = data.split(":", 1)
 
-        request = state.get(request_id)
+        # Handle session reply action
+        if action == "reply":
+            session = sessions.get(target_id)
+            if not session:
+                await query.edit_message_text("⚠️ Session no longer exists.")
+                return
+
+            chat_id = update.effective_chat.id
+            self._reply_targets[chat_id] = target_id
+
+            await query.edit_message_text(
+                f"📝 *Reply mode active*\n\n"
+                f"📁 `{session.display_cwd}`\n\n"
+                f"Type your message and I'll send it to this session.\n"
+                f"Use /cancel to exit reply mode.",
+                parse_mode="Markdown",
+            )
+            return
+
+        # Handle permission actions
+        request = state.get(target_id)
         if not request:
             await query.edit_message_text("⚠️ Request expired or already handled.")
             return

@@ -121,9 +121,14 @@ Uninstall service:
 
 ### 7. Start Claude Code
 
+For session input feature to work, start Claude Code inside tmux:
+
 ```bash
+tmux new -s claude
 claude
 ```
+
+This allows the bridge to send your replies from Telegram directly to Claude Code.
 
 ## Usage
 

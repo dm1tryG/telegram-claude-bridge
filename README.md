@@ -28,6 +28,8 @@ A daemon service that forwards Claude Code permission requests to Telegram for a
 - **Bidirectional Input** — Send text input to Claude Code from Telegram
 - **Authorization** — Bot only responds to configured chat ID
 
+![Telegram Screenshot](docs/telegram-screenshot.png)
+
 ## Requirements
 
 - Python 3.11+
